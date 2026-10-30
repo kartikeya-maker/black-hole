@@ -1,0 +1,291 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Event Horizon</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="theme-color" content="#04050b">
+<style>
+/* Layout: one full-screen WebGL canvas, nothing else. Single dark look by choice. */
+:root { --void: #04050b; --ink-dim: #a09eb6; --ice: #8ec5ff; color-scheme: dark; }
+html, body { height: 100%; overscroll-behavior: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+.hint { position: fixed; left: 0; right: 0; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); text-align: center; font-size: 13px; letter-spacing: .02em; color: var(--ink-dim); pointer-events: none; transition: opacity 1s; padding: 0 16px; }
+.hint.gone { opacity: 0; }
+body { margin: 0; background: var(--void); color: var(--ink-dim); font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; overflow: hidden; }
+#bh { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; background: var(--void); }
+#bh:active { cursor: grabbing; }
+.fallback { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px; text-align: center; }
+</style>
+<canvas id="bh" aria-label="Real-time render of a black hole with a glowing accretion disk bending light around it" role="img"></canvas>
+<div class="hint" id="hint">Drag up/down to tilt · pinch to zoom · double-tap for auto</div>
+<div class="fallback" id="fallback">This render needs WebGL, which this browser has turned off.</div>
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+<script id="fs" type="x-shader/x-fragment">
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec2 uRes;
+uniform float uTime, uPitch, uDist, uBeam, uDisk;
+
+float h31(vec3 p){
+  p = fract(p * vec3(.1031, .1030, .0973));
+  p += dot(p, p.yzx + 33.33);
+  return fract((p.x + p.y) * p.z);
+}
+float vnoise(vec3 p){
+  vec3 i = floor(p), f = fract(p);
+  f = f * f * (3. - 2. * f);
+  return mix(
+    mix(mix(h31(i), h31(i + vec3(1,0,0)), f.x), mix(h31(i + vec3(0,1,0)), h31(i + vec3(1,1,0)), f.x), f.y),
+    mix(mix(h31(i + vec3(0,0,1)), h31(i + vec3(1,0,1)), f.x), mix(h31(i + vec3(0,1,1)), h31(i + vec3(1,1,1)), f.x), f.y),
+    f.z);
+}
+float fbm(vec3 p){
+  float a = .5, s = 0.;
+  for(int i = 0; i < 4; i++){ s += a * vnoise(p); p = p * 2.03 + 7.1; a *= .5; }
+  return s;
+}
+
+vec3 ramp(float t){
+  vec3 c = mix(vec3(.32, .035, .01), vec3(1., .40, .07), smoothstep(0., .45, t));
+  c = mix(c, vec3(1., .78, .50), smoothstep(.35, .95, t));
+  c = mix(c, vec3(.74, .86, 1.), smoothstep(.95, 1.8, t));
+  return c;
+}
+
+vec3 sky(vec3 d){
+  vec3 col = vec3(0.);
+  for(int i = 0; i < 3; i++){
+    float s = 70. + float(i) * 85.;
+    vec3 p = d * s;
+    vec3 id = floor(p);
+    vec3 f = fract(p) - .5;
+    float h = h31(id + float(i) * 17.3);
+    if(h > .955){
+      vec3 off = (vec3(h31(id + 1.7), h31(id + 3.1), h31(id + 5.3)) - .5) * .5;
+      float dd = length(f - off);
+      float b = smoothstep(.16, 0., dd) * (h - .955) * 22.;
+      vec3 tint = mix(vec3(1., .78, .6), vec3(.65, .78, 1.), h31(id + 9.1));
+      col += tint * b;
+    }
+  }
+  vec3 n = normalize(vec3(.3, .9, .25));
+  float band = exp(-pow(dot(d, n) * 3.2, 2.));
+  col += vec3(.10, .08, .13) * band * (.3 + fbm(d * 5. + 3.) * 1.1);
+  col += vec3(.010, .012, .028);
+  return col;
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - .5 * uRes) / min(uRes.x, uRes.y);
+  vec3 ro = uDist * vec3(0., sin(uPitch), cos(uPitch));
+  vec3 fw = -normalize(ro);
+  vec3 rt = normalize(cross(fw, vec3(0., 1., 0.)));
+  vec3 up = cross(rt, fw);
+  vec3 rd = normalize(fw * 1.45 + rt * uv.x + up * uv.y);
+
+  vec3 pos = ro, vel = rd;
+  vec3 L = cross(pos, vel);
+  float h2 = dot(L, L);
+
+  vec3 col = vec3(0.);
+  float trans = 1.;
+  float minr = 1e9;
+  bool absorbed = false;
+
+  for(int i = 0; i < 340; i++){
+    float r2 = dot(pos, pos);
+    float r = sqrt(r2);
+    minr = min(minr, r);
+    if(r < 1.0){ absorbed = true; break; }
+    if(r > uDist + 4. && dot(pos, vel) > 0.) break;
+
+    float dt = clamp(.04 * (r - .9), .02, 1.0);
+    vec3 acc = -1.5 * h2 * pos / (r2 * r2 * r);
+    vec3 pp = pos;
+    vel += acc * dt;
+    vel = normalize(vel);
+    pos += vel * dt;
+
+    if(uDisk > .5 && pp.y * pos.y < 0.){
+      float k = pp.y / (pp.y - pos.y);
+      vec3 hp = mix(pp, pos, k);
+      float rr = length(hp.xz);
+      if(rr > 3.0 && rr < 10.5){
+        float edge = smoothstep(3.0, 3.5, rr) * (1. - smoothstep(7.5, 10.5, rr));
+        float a = atan(hp.z, hp.x);
+        float om = 2.6 / (rr * sqrt(rr));
+        float ang = a - uTime * om * .35;
+        vec3 q = vec3(cos(ang), sin(ang), 0.) * 2.4 + vec3(0., 0., rr * 3.2);
+        float n = fbm(q);
+        float rings = .65 + .35 * sin(rr * 11. + n * 5.);
+        float dens = clamp((n - .25) * 2.4, 0., 1.) * rings;
+        dens = mix(dens, 1., .25) * edge;
+
+        float beta = sqrt(.5 / rr);
+        vec3 vd = normalize(vec3(-hp.z, 0., hp.x)) * beta;
+        float gam = 1. / sqrt(1. - beta * beta);
+        float D = 1. / (gam * (1. - dot(vd, -vel)));
+        float g = sqrt(max(1. - 1. / rr, .01));
+        float shift = mix(1., D * g, uBeam);
+        float boost = mix(1., pow(D * g, 3.), uBeam);
+
+        float T = 1.5 * pow(3. / rr, .75);
+        float I = .85 * pow(3. / rr, 1.3);
+        vec3 e = ramp(T * shift) * I * boost;
+        float op = clamp(dens * .9, 0., 1.);
+        col += trans * e * op;
+        trans *= 1. - op;
+      }
+    }
+  }
+
+  if(!absorbed){
+    col += trans * sky(normalize(vel));
+    col += vec3(1., .62, .32) * .05 * exp(-max(minr - 1.5, 0.) * 2.2) * trans * uDisk;
+  }
+
+  col = 1. - exp(-col * 1.25);
+  col *= mix(.55, 1., smoothstep(1.3, .2, length(uv)));
+  col += (h31(vec3(gl_FragCoord.xy, uTime)) - .5) * .012;
+  gl_FragColor = vec4(max(col, 0.), 1.);
+}
+</script>
+<script>
+(function () {
+  var canvas = document.getElementById('bh');
+  var fallback = document.getElementById('fallback');
+  var gl = null;
+  try {
+    gl = canvas.getContext('webgl', { antialias: false, alpha: false, powerPreference: 'high-performance' }) ||
+         canvas.getContext('experimental-webgl');
+  } catch (e) { gl = null; }
+  if (!gl) { fallback.style.display = 'flex'; return; }
+
+  function compile(type, src) {
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); return null; }
+    return s;
+  }
+  var vs = compile(gl.VERTEX_SHADER, document.getElementById('vs').textContent);
+  var fs = compile(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent);
+  if (!vs || !fs) { fallback.style.display = 'flex'; return; }
+  var prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(prog)); fallback.style.display = 'flex'; return; }
+  gl.useProgram(prog);
+
+  var buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  var loc = gl.getAttribLocation(prog, 'aPos');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  var U = {};
+  ['uRes', 'uTime', 'uPitch', 'uDist', 'uBeam', 'uDisk'].forEach(function (n) { U[n] = gl.getUniformLocation(prog, n); });
+
+  var reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var auto = !reduce;
+  var mobile = (window.matchMedia && matchMedia('(pointer: coarse)').matches) || Math.min(innerWidth, innerHeight) < 600;
+  var maxScale = mobile ? 0.7 : Math.min(window.devicePixelRatio || 1, 1.5);
+  var scale = maxScale, minScale = 0.3;
+  var hint = document.getElementById('hint');
+  function hideHint() { hint.classList.add('gone'); }
+  setTimeout(hideHint, 6000);
+  function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
+  var tilt = 9, dist = 27;
+  var running = true, visible = true, raf = 0, last = 0, ema = 16, frames = 0;
+
+  function resize() {
+    var w = Math.max(2, Math.floor(window.innerWidth * scale));
+    var h = Math.max(2, Math.floor(window.innerHeight * scale));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w; canvas.height = h;
+      gl.viewport(0, 0, w, h);
+    }
+  }
+
+  function draw(now) {
+    gl.uniform2f(U.uRes, canvas.width, canvas.height);
+    gl.uniform1f(U.uTime, reduce ? 3.0 : now * 0.001);
+    gl.uniform1f(U.uPitch, tilt * Math.PI / 180);
+    gl.uniform1f(U.uDist, dist);
+    gl.uniform1f(U.uBeam, 1);
+    gl.uniform1f(U.uDisk, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  function frame(now) {
+    raf = 0;
+    if (!running || !visible || document.hidden) return;
+    var dt = now - last; last = now;
+    if (dt > 0 && dt < 500) ema = ema * 0.94 + dt * 0.06;
+    if (auto) tilt = 17 + 13 * Math.sin(now * 0.00028);
+    draw(now);
+    frames++;
+    if (frames % 30 === 0 && ema > 28 && scale > minScale) { scale = Math.max(minScale, scale * 0.82); resize(); }
+    if (!reduce || auto) schedule();
+  }
+  function schedule() { if (!raf) raf = requestAnimationFrame(frame); }
+  function once() { if (!raf) raf = requestAnimationFrame(function (n) { raf = 0; draw(n); }); }
+  function kick() { if (reduce && !auto) once(); else schedule(); }
+
+  var pts = {}, lastY = 0, pinch0 = 0, dist0 = 0, lastTap = 0, pinched = false;
+  function keys() { return Object.keys(pts); }
+  function span() { var k = keys(), p = pts[k[0]], q = pts[k[1]]; return Math.hypot(p.x - q.x, p.y - q.y); }
+  canvas.addEventListener('pointerdown', function (e) {
+    pts[e.pointerId] = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, moved: false };
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    if (keys().length === 1) { lastY = e.clientY; pinched = false; }
+    if (keys().length === 2) { pinch0 = span(); dist0 = dist; pinched = true; }
+    hideHint();
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    var p = pts[e.pointerId]; if (!p) return;
+    p.x = e.clientX; p.y = e.clientY;
+    if (Math.hypot(p.x - p.sx, p.y - p.sy) > 10) p.moved = true;
+    if (keys().length >= 2) {
+      var s = span();
+      if (pinch0 > 0 && s > 0) dist = clamp(dist0 * pinch0 / s, 16, 45);
+      kick(); return;
+    }
+    tilt = clamp(tilt + (e.clientY - lastY) * (e.pointerType === 'mouse' ? 0.25 : 0.35), 0, 88);
+    lastY = e.clientY;
+    auto = false; kick();
+  });
+  function endPtr(e) {
+    var p = pts[e.pointerId]; if (!p) return;
+    delete pts[e.pointerId];
+    var k = keys();
+    if (k.length === 1) lastY = pts[k[0]].y;
+    if (e.type === 'pointerup' && k.length === 0 && !p.moved && !pinched) {
+      var t = performance.now();
+      if (t - lastTap < 320) { auto = true; kick(); lastTap = 0; } else lastTap = t;
+    }
+  }
+  canvas.addEventListener('pointerup', endPtr);
+  canvas.addEventListener('pointercancel', endPtr);
+  canvas.addEventListener('dblclick', function () { auto = true; kick(); });
+  canvas.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    dist = clamp(dist + Math.sign(e.deltaY) * 1.5, 16, 45);
+    kick();
+  }, { passive: false });
+
+  window.addEventListener('resize', function () { resize(); kick(); });
+  if ('IntersectionObserver' in window) {
+    new IntersectionObserver(function (en) { visible = en[0].isIntersecting; if (visible) { last = performance.now(); kick(); } }).observe(canvas);
+  }
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) { last = performance.now(); kick(); } });
+
+  resize(); kick();
+})();
+</script>
+
+</body></html>
